@@ -39,12 +39,12 @@ namespace corryvreckan {
     private:
         void decodeAndStore(const HitData& data, PixelVector& hits, const std::string& det_name);
 
-        TChain chL{"MALTA"};
-        TChain chU{"MALTA"};
-        HitData dataL, dataU;
+        std::vector<std::unique_ptr<TChain>> chains_;
+        std::vector<HitData> data_buffer_;
+        std::vector<std::string> det_names_;
+        std::vector<Long64_t> num_entries_;
+        std::vector<Long64_t> current_indices_;
 
-        Long64_t nL, nU;
-        Long64_t iL, iU;
         uint32_t ev_count;
     };
 }
