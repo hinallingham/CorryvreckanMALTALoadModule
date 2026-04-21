@@ -1,49 +1,50 @@
 # EventLoaderMALTA
 
-## Overview / 概要
+**Maintainer**: Hinata Nakamura (hnakamura@quark.hiroshima-u.ac.jp)
+**Module Type**: DETECTOR
+**Status**: Functional / Active Development
 
-**English:**
-This module is a custom `EventLoader` for Corryvreckan, specifically designed to read MALTA2 detector data directly from ROOT files. It was developed to bypass the complexities and potential errors associated with converting ROOT data to EUDAQ2 RAW formats. It serves as a **Global Module**, managing the synchronization of multiple MALTA2 planes within a single process.
+## Description
+The `EventLoaderMALTA` module is a dedicated data loader designed to interface MALTA2 raw data (stored in ROOT TTree format) with the Corryvreckan framework. Unlike standard loaders, this module implements a robust synchronization logic specifically for the MALTA2 DAQ output, utilizing the **L1ID (Level-1 ID)** as the primary trigger reference.
 
-**日本語:**
-このモジュールは、MALTA2検出器のデータをROOTファイルから直接Corryvreckanに読み込むためのカスタム`EventLoader`です。ROOTからEUDAQ2 RAW形式への変換に伴うエラーや手間を省くために開発されました。**グローバルモジュール**として動作し、1つのプロセスで複数のMALTA2レイヤーの同期を管理します。
+The module follows a **Master-Slave synchronization architecture**:
+1. **Master Plane (Plane 0)**: Defines the target L1ID for the current Corryvreckan event.
+2. **Slave Planes**: The loader scans the data stream for matching L1IDs to group hits from the same physical particle incident into a single event clipboard.
 
----
+This ensures high-fidelity event building even in high-occupancy environments or scenarios with significant data-stream latencies between planes.
 
-## Key Features / 主な特徴
-
-- **Direct ROOT Access**: No need for intermediate file conversion.
-- **L1ID-Based Synchronization**: Automatically synchronizes "Lower" and "Upper" sensor data by matching their `L1ID` (Level 1 Trigger ID).
-- **Sweep Logic**: Robustly handles data by sweeping all hits associated with a specific `L1ID` into a single Corryvreckan `Event`.
-- **Modern C++ Compliance**: Optimized to avoid compiler warnings and ensure memory safety within the Corryvreckan framework.
-
-- **ROOT直読み**: 中間ファイル（.raw）への変換が不要。
-- **L1IDベースの同期**: `L1ID`（トリガーID）をキーにして、LowerとUpperのセンサーデータを自動的に同期。
-- **スイープ・ロジック**: 特定の`L1ID`に紐付く全ヒットを1つのCorryvreckan `Event`として確実に回収する堅牢な実装。
-- **モダンC++準拠**: フレームワーク内でのメモリ安全性を確保し、コンパイラ警告を排除した最適化済みコード。
+## Key Features
+* **Smart Path Builder**: Automatically resolves file paths using a base directory and a 6-digit run number (e.g., `run_000123_0.root.root`).
+* **L1ID Synchronization**: Trigger-ID based event building that handles plane-to-plane clock drifts.
+* **Sync Health Monitor**: Real-time tracking of the coincidence rate with automatic console warnings (LOG(WARNING)) if synchronization stability drops.
+* **Integrated Masking**: Full support for Corryvreckan's standard `.txt` mask files via the `detector->isMasked(x, y)` interface.
+* **Beam Profile Analytics**: Automatic generation of 2D hit maps and 1D projections for immediate beam spot and divergence evaluation.
 
 ---
 
-## Parameters / パラメータ
+## Parameters
 
-| Parameter | Description |
-| :--- | :--- |
-| `file_lower` | Path to the ROOT file for the Lower detector (MALTA_0). |
-| `file_upper` | Path to the ROOT file for the Upper detector (MALTA_1). |
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `base_path` | string | Directory path containing the raw ROOT files. |
+| `run_number` | int | The run ID used to automatically find and load files. |
+| `detector_names`| array | List of detector names defined in the geometry file (order matters). |
 
-| パラメータ | 説明 |
-| :--- | :--- |
-| `file_lower` | Lower検出器（MALTA_0）のROOTファイルパス。 |
-| `file_upper` | Upper検出器（MALTA_1）のROOTファイルパス。 |
+## Plots Produced
+
+### 2D Histograms
+* **`hHitMap_<detector>`**: Global hit occupancy map for beam profile visualization.
+* **`hCoincidenceRateTrend`**: A `TProfile` showing the coincidence rate [%] vs. Event Number to monitor synchronization stability throughout the run.
+
+### 1D Histograms
+* **`hHitX / hHitY`**: Projections of the hit map for beam width ($\sigma$) and centroid calculations.
+* **`hSyncRate`**: Distribution of the global coincidence rate.
 
 ---
 
-## Usage / 使い方
-
-Add the following block to your Corryvreckan configuration (`.conf`) file:
-Corryvreckanのコンフィグファイル（`.conf`）に以下のブロックを追加して使用します。
-
+## Usage
 ```ini
 [EventLoaderMALTA]
-file_lower = "/path/to/your/lower_data.root"
-file_upper = "/path/to/your/upper_data.root"
+base_path = "/home/user/data/beamtest_2026"
+run_number = 112
+detector_names = "Plane0", "Plane1", "Plane2"

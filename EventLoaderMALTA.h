@@ -6,6 +6,7 @@
 #include <string>
 
 #include "TChain.h"
+#include "TProfile.h"
 
 #include "core/module/Module.hpp"
 #include "objects/Pixel.hpp"
@@ -45,7 +46,13 @@ namespace corryvreckan {
         std::vector<Long64_t> num_entries_;
         std::vector<Long64_t> current_indices_;
 
+        TProfile* hCoincidenceRateTrend;
+
+        // counter for events processed, used for debugging and logging
+
         uint32_t ev_count;
+        double total_ev_count = 0;
+        double coincidence_ev_count = 0;
     };
 }
 #endif
