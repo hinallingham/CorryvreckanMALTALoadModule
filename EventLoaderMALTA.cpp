@@ -92,46 +92,56 @@ void EventLoaderMALTA::decodeAndStore(const HitData& data, PixelVector& hits, co
 }
 
 StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
+
     size_t n_planes = chains_.size();
-    
-    // When all entries have been processed, put a dummy event and end the run
-    if (current_indices_[0] >= num_entries_[0]) {
+    uint32_t target_l1id = 0xFFFFFFFF;
+    bool any_data_left = false;
+
+    // Scan all planes to find the minimum L1ID (target_l1id) among the current entries
+    for (size_t i = 0; i < n_planes; ++i) {
+        if (current_indices_[i] < num_entries_[i]) {
+            any_data_left = true;
+            chains_[i]->GetEntry(current_indices_[i]);
+            uint32_t current_l1id = static_cast<uint32_t>(data_buffer_[i].l1id);
+        
+            if (current_l1id < target_l1id) {
+                target_l1id = current_l1id;
+            }
+        }
+    }
+
+    // if no data is left in any plane, we are done with the run
+    if (!any_data_left) {
         auto dummy_event = std::make_shared<Event>(0, 1);
         clipboard->putEvent(dummy_event);
         return StatusCode::EndRun;
     }
 
-    // Master algorithm:
-    chains_[0]->GetEntry(current_indices_[0]);
-    UInt_t target_l1id = data_buffer_[0].l1id;
-
+    // Collect hits from all planes that match the target L1ID
     std::vector<PixelVector> all_hits_vec(n_planes);
-
-    // Each plane, advance until we find the target_l1id, then decode and store all hits with that l1id
     for (size_t i = 0; i < n_planes; ++i) {
-        if (i > 0) {
+        if (current_indices_[i] >= num_entries_[i]) continue;
+
+        // Compare the current entry's L1ID with the target L1ID
+        if (static_cast<uint32_t>(data_buffer_[i].l1id) == target_l1id) {
+            // get all hits for this L1ID in the current plane
             while (current_indices_[i] < num_entries_[i]) {
                 chains_[i]->GetEntry(current_indices_[i]);
-                if (data_buffer_[i].l1id < target_l1id) current_indices_[i]++;
-                else break;
+                if (static_cast<uint32_t>(data_buffer_[i].l1id) == target_l1id) {
+                    decodeAndStore(data_buffer_[i], all_hits_vec[i], det_names_[i]);
+                    current_indices_[i]++;
+                } else {
+                    break; // Move to the next plane after processing all entries with the current target L1ID
+                }
             }
-        }
-        while (current_indices_[i] < num_entries_[i]) {
-            chains_[i]->GetEntry(current_indices_[i]);
-            if (data_buffer_[i].l1id == target_l1id) {
-                decodeAndStore(data_buffer_[i], all_hits_vec[i], det_names_[i]);
-                current_indices_[i]++;
-            } else break;
         }
     }
 
-    // Determine event time window based on the hits found, with some padding. If no hits are found, use a default window.
-    double min_t = 0;
-    double max_t = 100;
-    bool has_any_hits = false;
-
+   // Set the event time window based on the earliest and latest timestamps among the collected hits
     double actual_min = std::numeric_limits<double>::max();
     double actual_max = std::numeric_limits<double>::lowest();
+    bool has_any_hits = false;
+
     for (const auto& hits : all_hits_vec) {
         for (const auto& p : hits) {
             actual_min = std::min(actual_min, p->timestamp());
@@ -140,45 +150,40 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
         }
     }
 
-    if (has_any_hits) {
-        min_t = actual_min;
-        max_t = actual_max;
-    }
+    // time window is set to [min-10ns, max+10ns] to allow for some timing uncertainty and ensure all hits are included in the event
+    double min_t = has_any_hits ? actual_min : 0;
+    double max_t = has_any_hits ? actual_max : 100;
 
-    // Store the event and hits on the clipboard
+    // Clipboard requires an event object, we create one with the time window covering all hits and add the target L1ID as a trigger
     auto event = std::make_shared<Event>(min_t - 10.0, max_t + 10.0);
     event->addTrigger(target_l1id, min_t);
     clipboard->putEvent(event);
 
-    total_ev_count++;
+    // Update the clipboard with the collected hits for this event, only if all planes have at least one hit to ensure we are working with coincident events
     bool all_plane_have_hits = true;
-
     for (size_t i = 0; i < n_planes; ++i) {
         if (!all_hits_vec[i].empty()) {
             clipboard->putData(all_hits_vec[i], det_names_[i]);
-        }
-    }
-
-    for (size_t i = 0; i < n_planes; ++i) {
-        if (all_hits_vec[i].empty()) {
+        } else {
             all_plane_have_hits = false;
-            break;
         }
     }
 
+    total_ev_count++;
     if (all_plane_have_hits) coincidence_ev_count++;
-
     ev_count++;
 
-    hCoincidenceRateTrend->Fill(static_cast<double>(ev_count), 
-                                (all_plane_have_hits ? 100.0 : 0.0));
+    // Output the coincidence rate trend for monitoring synchronization health. The rate is calculated as the percentage of events where all planes have hits (coincidence) out of the total events processed.
+    hCoincidenceRateTrend->Fill(static_cast<double>(ev_count), (all_plane_have_hits ? 100.0 : 0.0));
 
     if (ev_count % 1000 == 0 && ev_count > 0) {
-
         double rate = static_cast<double>(coincidence_ev_count) / total_ev_count * 100.0;
-        LOG(INFO) << "Sync Health Check: Coincidence Rate = " << std::fixed << std::setprecision(2) << rate << "%";
+        LOG(INFO) << "Sync Health Check: Run progress = " << ev_count << " events, Coincidence Rate = " 
+                  << std::fixed << std::setprecision(2) << rate << "%";
 
-        if (rate < 10.0) LOG(WARNING) << "!!! WARNING: Sync rate is very low (" << rate << "%). Check L1ID synchronization!";
+        if (rate < 10.0) {
+            LOG(WARNING) << "!!! WARNING: Sync rate is very low (" << rate << "%). Check Plane connections or L1ID consistency!";
+        }
     }
 
     return StatusCode::Success;
