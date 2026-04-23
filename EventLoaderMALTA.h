@@ -51,6 +51,8 @@ namespace corryvreckan {
         // counter for events processed, used for debugging and logging
 
         uint32_t ev_count;
+        size_t skip_entries_{0};
+        size_t max_events_{0};
         double total_ev_count = 0;
         double coincidence_ev_count = 0;
     };

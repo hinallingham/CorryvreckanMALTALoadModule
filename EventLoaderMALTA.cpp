@@ -12,47 +12,74 @@ EventLoaderMALTA::EventLoaderMALTA(Configuration& config, std::vector<std::share
 
 void EventLoaderMALTA::initialize() {
     
-    // Get configuration parameters
-    std::string base_path = config_.get<std::string>("base_path");
-    int run_number = config_.get<int>("run_number");
-    det_names_ = config_.getArray<std::string>("detector_names"); // ["Plane0", "Plane1", "Plane2", ...]
-
+    det_names_ = config_.getArray<std::string>("detector_names");
     size_t n_planes = det_names_.size();
-    
-    // ready the data files and set up TChains
+
+    size_t skip_entries = config_.get<size_t>("skip_entries", 0);
+    max_events_ = config_.get<size_t>("number_of_events", 0);
+
+    LOG(STATUS) << "Near-Online Setup: Skip=" << skip_entries 
+                << ", MaxEvents=" << (max_events_ > 0 ? std::to_string(max_events_) : "Unlimited");
+
+    std::vector<std::string> file_paths;
+    if(config_.has("file_names")) {
+        file_paths = config_.getArray<std::string>("file_names");
+        LOG(STATUS) << "Custom file_names provided. Ignoring base_path and run_number.";
+    }
+
     data_buffer_.resize(n_planes);
     num_entries_.resize(n_planes);
     current_indices_.assign(n_planes, 0);
     ev_count = 0;
 
-    // Automatically construct file paths and set up TChains for each plane
     for (size_t i = 0; i < n_planes; ++i) {
+        std::string file_path;
 
-        std::ostringstream ss;
-        // path example: /data/run_000123_0.root.root, /data/run_000123_1.root.root, ...
-        ss << base_path << "/run_" 
-           << std::setw(6) << std::setfill('0') << run_number 
-           << "_" << i << ".root.root";
-        
-        std::string file_path = ss.str();
-        
+        if (!file_paths.empty()) {
+
+            if (i < file_paths.size()) {
+                file_path = file_paths[i];
+            } else {
+                throw InvalidValueError(config_, "file_names", "Not enough file paths provided for all detectors!");
+            }
+        } else {
+            std::string base_path = config_.get<std::string>("base_path");
+            int run_number = config_.get<int>("run_number");
+            
+            std::ostringstream ss;
+            ss << base_path << "/run_" 
+               << std::setw(6) << std::setfill('0') << run_number 
+               << "_" << i << ".root.root";
+            file_path = ss.str();
+        }
+        // -----------------------
+
         auto chain = std::make_unique<TChain>("MALTA");
         chain->Add(file_path.c_str());
         
         num_entries_[i] = chain->GetEntries();
         if (num_entries_[i] == 0) {
-            throw InvalidValueError(config_, "run_number", "No entries found in file: " + file_path);
+            throw InvalidValueError(config_, "file_names", "No entries found in file: " + file_path);
         }
+
+        current_indices_[i] = static_cast<long long int>(std::min(skip_entries, static_cast<size_t>(num_entries_[i])));
 
         data_buffer_[i].setBranchAddresses(chain.get());
         chains_.push_back(std::move(chain));
 
-        LOG(STATUS) << "Plane " << i << " [" << det_names_[i] << "] Completed: " << file_path;
+        LOG(STATUS) << "Plane " << i << " [" << det_names_[i] << "] Loaded: " << file_path;
+    }
+
+    double x_start = static_cast<double>(skip_entries);
+    double x_end = x_start + static_cast<double>(max_events_);
+
+    if(max_events_ == 0) {
+        x_end = x_start + 1000000.0;
     }
 
     hCoincidenceRateTrend = new TProfile("hCoincidenceRateTrend", 
-                                         "Coincidence Rate Trend;Event Number;Coincidence Rate [%]", 
-                                         1000, 0, 10000000);
+                                         "Coincidence Rate Trend;Event Number (Absolute);Coincidence Rate [%]", 
+                                         1000, x_start, x_end);
 }
 
 void EventLoaderMALTA::decodeAndStore(const HitData& data, PixelVector& hits, const std::string& det_name) {
@@ -93,6 +120,15 @@ void EventLoaderMALTA::decodeAndStore(const HitData& data, PixelVector& hits, co
 
 StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
 
+    if (max_events_ > 0 && ev_count >= max_events_) {
+        LOG(STATUS) << "Reached max_events (" << max_events_ << "). Ending run.";
+
+        auto dummy_event = std::make_shared<Event>(0, 0);
+        clipboard->putEvent(dummy_event);
+
+        return StatusCode::EndRun;
+    }
+
     size_t n_planes = chains_.size();
     uint32_t target_l1id = 0xFFFFFFFF;
     bool any_data_left = false;
@@ -102,7 +138,7 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
         if (current_indices_[i] < num_entries_[i]) {
             any_data_left = true;
             chains_[i]->GetEntry(current_indices_[i]);
-            uint32_t current_l1id = static_cast<uint32_t>(data_buffer_[i].l1id);
+            uint32_t current_l1id = data_buffer_[i].l1id;
         
             if (current_l1id < target_l1id) {
                 target_l1id = current_l1id;
@@ -123,11 +159,11 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
         if (current_indices_[i] >= num_entries_[i]) continue;
 
         // Compare the current entry's L1ID with the target L1ID
-        if (static_cast<uint32_t>(data_buffer_[i].l1id) == target_l1id) {
+        if (data_buffer_[i].l1id == target_l1id) {
             // get all hits for this L1ID in the current plane
             while (current_indices_[i] < num_entries_[i]) {
                 chains_[i]->GetEntry(current_indices_[i]);
-                if (static_cast<uint32_t>(data_buffer_[i].l1id) == target_l1id) {
+                if (data_buffer_[i].l1id == target_l1id) {
                     decodeAndStore(data_buffer_[i], all_hits_vec[i], det_names_[i]);
                     current_indices_[i]++;
                 } else {
