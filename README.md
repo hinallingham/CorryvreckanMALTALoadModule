@@ -1,50 +1,209 @@
-# EventLoaderMALTA
+<div align="right">
+  🌐 &nbsp;<strong>English</strong> &nbsp;|&nbsp; <a href="README_ja.md">日本語</a>
+</div>
 
-**Maintainer**: Hinata Nakamura (hnakamura@quark.hiroshima-u.ac.jp)
-**Module Type**: DETECTOR
-**Status**: Functional / Active Development
+<h1 align="center">EventLoaderMALTA</h1>
+<p align="center">
+  MALTA2 raw data loader for the Corryvreckan reconstruction framework
+</p>
+<p align="center">
+  <img src="https://img.shields.io/badge/maintainer-Hinata%20Nakamura-informational?style=flat-square" />
+  <img src="https://img.shields.io/badge/type-DETECTOR-blueviolet?style=flat-square" />
+  <img src="https://img.shields.io/badge/status-Active%20Development-brightgreen?style=flat-square" />
+  <img src="https://img.shields.io/badge/near--online-supported-orange?style=flat-square" />
+</p>
+
+---
 
 ## Description
-The `EventLoaderMALTA` module is a dedicated data loader designed to interface MALTA2 raw data (stored in ROOT TTree format) with the Corryvreckan framework. Unlike standard loaders, this module implements a robust synchronization logic specifically for the MALTA2 DAQ output, utilizing the **L1ID (Level-1 ID)** as the primary trigger reference.
 
-The module follows a **Master-Slave synchronization architecture**:
-1. **Master Plane (Plane 0)**: Defines the target L1ID for the current Corryvreckan event.
-2. **Slave Planes**: The loader scans the data stream for matching L1IDs to group hits from the same physical particle incident into a single event clipboard.
+`EventLoaderMALTA` loads MALTA2 hit data stored as ROOT TTrees by MaltaMultiDAQ
+into the Corryvreckan clipboard. It uses the **L1ID** as the primary trigger reference
+to synchronize hits across multiple detector planes.
 
-This ensures high-fidelity event building even in high-occupancy environments or scenarios with significant data-stream latencies between planes.
+**Synchronization model**
+
+1. **Plane 0 (Master)** — sets the target L1ID for each Corryvreckan event.
+2. **Remaining planes (Slaves)** — matched against the same L1ID to form a coincident event.
+
+---
 
 ## Key Features
-* **Smart Path Builder**: Automatically resolves file paths using a base directory and a 6-digit run number (e.g., `run_000123_0.root.root`).
-* **L1ID Synchronization**: Trigger-ID based event building that handles plane-to-plane clock drifts.
-* **Sync Health Monitor**: Real-time tracking of the coincidence rate with automatic console warnings (LOG(WARNING)) if synchronization stability drops.
-* **Integrated Masking**: Full support for Corryvreckan's standard `.txt` mask files via the `detector->isMasked(x, y)` interface.
-* **Beam Profile Analytics**: Automatic generation of 2D hit maps and 1D projections for immediate beam spot and divergence evaluation.
+
+| Feature | Description |
+| :--- | :--- |
+| **l1idC event grouping** | Uses 32-bit non-wrapping `l1idC` counter instead of 12-bit `l1id` — avoids rollover after 4096 triggers on real hardware |
+| L1ID synchronization | Trigger-ID based event building; handles inter-plane clock drifts |
+| Multi-run stitching | Chain multiple ROOT files seamlessly via `run_number` array |
+| Explicit file list | Override auto path with `file_names` for custom setups (bypasses `.root.root` / `.root` extension difference) |
+| Column filter | Process only `even` / `odd` columns (useful for cross-check studies) |
+| Sync health monitor | Coincidence rate tracked per 1000 events with automatic `LOG(WARNING)` |
+| Integrated masking | Corryvreckan `.txt` mask files via `detector->masked(x, y)` |
+| **Near-online mode** | TChain is recreated from scratch on each refresh cycle — avoids ROOT's stale internal `fEntries` problem that prevented `GetEntry()` from reading newly written rows |
+| **Dynamic-axis trends** | All TProfile histograms start with a small range and auto-extend + rebin to ~200 bins regardless of total event count |
 
 ---
 
 ## Parameters
 
-| Parameter | Type | Description |
-| :--- | :--- | :--- |
-| `base_path` | string | Directory path containing the raw ROOT files. |
-| `run_number` | int | The run ID used to automatically find and load files. |
-| `detector_names`| array | List of detector names defined in the geometry file (order matters). |
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `detector_names` | array\<string\> | — | Plane names in geometry file order |
+| `base_path` | string | — | Directory containing raw ROOT files |
+| `run_number` | array\<int\> | — | Run ID(s) to load (supports multi-run merge) |
+| `file_names` | array\<string\> | — | Explicit file paths (overrides `base_path` / `run_number`) |
+| `skip_entries` | int | `0` | Skip the first N entries |
+| `number_of_events` | int | `0` | Stop after N events (0 = unlimited) |
+| `column_filter` | string | `"none"` | `"none"` / `"even"` / `"odd"` |
+| `online_mode` | bool | `false` | Keep the run alive when data is exhausted (near-online streaming) |
+| `real_data` | bool | `false` | Apply `y -= 288` offset for real MALTA2 hardware. Active pixels on real chips occupy rows 288–511 in raw coordinates; this shifts them to 0–223 so they fall within the detector bounds. Leave unset (or `false`) for simulation where rows run 0–511 from the start. |
+
+---
 
 ## Plots Produced
 
-### 2D Histograms
-* **`hHitMap_<detector>`**: Global hit occupancy map for beam profile visualization.
-* **`hCoincidenceRateTrend`**: A `TProfile` showing the coincidence rate [%] vs. Event Number to monitor synchronization stability throughout the run.
+All TProfile trend histograms use a dynamic x-axis: initial range is `[skip_entries, skip_entries+200]`
+with `SetCanExtend`, and bins are merged back to ~200 each time ROOT doubles the range on fill.
 
-### 1D Histograms
-* **`hHitX / hHitY`**: Projections of the hit map for beam width ($\sigma$) and centroid calculations.
-* **`hSyncRate`**: Distribution of the global coincidence rate.
+| Name | Type | Description |
+| :--- | :--- | :--- |
+| `hCoincidenceRateTrend` | TProfile | Coincidence rate [%] vs. event number |
+| `hHitsPerEventTrend_<det>` | TProfile | Mean hits/event over time per plane |
+| `hHitsPerEventDist_<det>` | TH1F | Distribution of hits/event per plane |
+| `hL1idCVsEvent` | TProfile | l1idC (hardware trigger count) vs. Corryvreckan event — slope > 1 means missed triggers |
+| `hL1idCPlaneDelta` | TH1F | Distribution of max(l1idC)−min(l1idC) across planes per event — 0 = perfect sync |
+| `hTimerVsEvent` | TProfile | Wall-clock elapsed time [s] vs. event number (MaltaDAQ only; 0 for simulation) |
 
 ---
 
 ## Usage
+
 ```ini
 [EventLoaderMALTA]
-base_path = "/home/user/data/beamtest_2026"
-run_number = 112
+base_path      = "/data/beamtest_2026"
+run_number     = 112, 113
 detector_names = "Plane0", "Plane1", "Plane2"
+column_filter  = "none"
+```
+
+For a near-online session (MaltaMultiDAQ running simultaneously):
+
+```ini
+[EventLoaderMALTA]
+base_path      = "/data/beamtest_2026"
+run_number     = 115
+detector_names = "Plane0", "Plane1", "Plane2"
+online_mode    = true    # keep alive when data is temporarily exhausted
+# number_of_events not set → runs until stopped manually
+```
+
+---
+
+## Near-Online Monitoring
+
+### How it works
+
+When `online_mode = true`, the loader does not stop when it runs out of entries.
+Instead, every 200 ms it **recreates the TChain** from the stored file paths so that ROOT
+reads a fully fresh file header.  This is more reliable than `TChain::Refresh()`, which
+updates the entry count externally but leaves the internal `TTree::fEntries` stale —
+causing `GetEntry()` to silently skip new rows.
+
+```
+MaltaDAQ write loop          EventLoaderMALTA run() loop
+──────────────────           ────────────────────────────
+FillTree(hits)               GetEntry(i)  → process
+...                          ...
+AutoSave()  ──flush──►       (200 ms)  new TChain created
+FillTree(hits)               GetEntry(new_i)  → process new entries
+```
+
+When `online_mode = false` (default), the loader returns `StatusCode::EndRun` as soon as
+all entries are consumed, which is the correct behaviour for offline reprocessing.
+
+### Requirements for near-online mode
+
+| Requirement | Detail |
+| :--- | :--- |
+| `online_mode = true` in config | Without this the loader exits on the first `NoData` condition |
+| MaltaDAQ must call `AutoSave()` periodically | `Refresh()` only picks up entries that have been flushed to disk; unflushed entries are invisible. Recommended cadence: every ~100 events (~1 s) |
+| Single writer, single reader on the same machine | ROOT does not support concurrent writers. Reading while one process writes is safe for local filesystems. NFS may cache stale file headers and cause missed entries |
+| `number_of_events` should be `0` or unset | Setting a finite limit causes `EndRun` once that count is reached, regardless of `online_mode` |
+
+### Files Changed
+
+| File | Line(s) | What was added |
+| :--- | :--- | :--- |
+| `EventLoaderMALTA.h` | 4 | `#include <chrono>` |
+| `EventLoaderMALTA.h` | 66 | `std::chrono::steady_clock::time_point last_refresh_time_` member |
+| `EventLoaderMALTA.cpp` | 89–93 | `LOG(WARNING)` on 0 entries instead of `InvalidValueError` |
+| `EventLoaderMALTA.cpp` | 102 | `last_refresh_time_` initialization in `initialize()` |
+| `EventLoaderMALTA.cpp` | 199–223 | Full refresh block in `run()`: `Refresh()` + `GetEntries()` + `setBranchAddresses()` + `NoData` |
+
+---
+
+### Problems Fixed
+
+| # | Location | Root cause | Fix |
+| :--- | :--- | :--- | :--- |
+| 1 | **Writer** (`Malta2TreeWriter`) | AutoSave called only when hits exist — silent stall when beam rate is low | Moved AutoSave check before the early-return path |
+| 2 | **Reader** `run()` — refresh | `TChain::Refresh()` updated external entry count but left internal `TTree::fEntries` stale; `GetEntry()` beyond old end silently returned nothing | Replaced with full TChain recreation every 200 ms |
+| 3 | **Reader** `run()` — l1id | Real hardware l1id is a 12-bit counter (wraps at 4096); after rollover planes appear out of sync | Switched event grouping to `l1idC` (32-bit non-wrapping) in both reader and writer |
+
+### Implementation
+
+**Fix 1 — AutoSave before early return** (`Malta2TreeWriter::run()`):
+
+```cpp
+// AutoSave checked first — runs even when the event has no hits
+auto now = std::chrono::steady_clock::now();
+if (elapsed_ms >= 1000.0) {
+    tree->AutoSave("SaveSelf");
+    last_autosave_time_ = now;
+}
+try {
+    hit_messages = messenger_->fetchMultiMessage<PixelHitMessage>(this, event);
+} catch (const MessageNotFoundException&) {
+    return;   // early return, but AutoSave already ran above
+}
+```
+
+**Fix 2 — TChain recreation instead of Refresh()**, throttled to once per 200 ms:
+
+```cpp
+if (!any_data_left && ms_elapsed >= 200.0) {
+    for (size_t i = 0; i < n_planes; ++i) {
+        auto fresh = std::make_unique<TChain>("MALTA");
+        for (const auto& path : chain_file_paths_[i]) fresh->Add(path.c_str());
+        Long64_t new_entries = fresh->GetEntries();
+        if (new_entries > num_entries_[i]) {
+            chains_[i]->ResetBranchAddresses();
+            chains_[i] = std::move(fresh);
+            data_buffer_[i].setBranchAddresses(chains_[i].get());
+            num_entries_[i] = new_entries;
+        }
+    }
+}
+```
+
+**Fix 3 — l1idC event grouping** (both writer and reader):
+
+```cpp
+// Writer (Malta2TreeWriter): fill l1idC with the event number
+l1idC_ = static_cast<unsigned int>(event->number);
+
+// Reader (EventLoaderMALTA): group by l1idC, not l1id
+uint32_t current = data_buffer_[i].l1idC;   // was: data_buffer_[i].l1id
+```
+
+### Stopping a near-online session
+
+With `number_of_events = 0` (unlimited), the run ends only when corryvreckan is stopped
+manually — via Ctrl-C or the **Exit** button in `OnlineMonitor`.
+
+---
+
+## See Also
+
+- [Malta2 README](../../../../MALTA2/Malta2/README.md) — writer-side changes (`AutoSave`)
+- [OnlineMonitor](../OnlineMonitor/) — real-time display module
