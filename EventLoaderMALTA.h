@@ -81,6 +81,7 @@ namespace corryvreckan {
 
         bool online_mode_{false};
         bool real_data_{false};
+        bool use_l1id_{false};
         std::chrono::steady_clock::time_point last_refresh_time_;
     };
 }

@@ -21,6 +21,10 @@ void EventLoaderMALTA::initialize() {
     max_events_ = config_.get<size_t>("number_of_events", 0);
     online_mode_ = config_.get<bool>("online_mode", false);
     real_data_   = config_.get<bool>("real_data", false);
+    use_l1id_    = config_.get<bool>("use_l1id", false);
+    if(use_l1id_) {
+        LOG(STATUS) << "Event grouping: using l1id (12-bit, wraps at 4096) instead of l1idC.";
+    }
 
     std::string filter_type = config_.get<std::string>("column_filter", "none");
     std::transform(filter_type.begin(), filter_type.end(), filter_type.begin(), ::tolower);
@@ -80,7 +84,7 @@ void EventLoaderMALTA::initialize() {
                 std::ostringstream ss;
                 ss << base_path << "/run_" 
                    << std::setw(6) << std::setfill('0') << run_numbers[r] 
-                   << "_" << i << ".root.root";
+                   << "_" << i << ".root";
                 std::string file_path = ss.str();
                 
                 chain->Add(file_path.c_str());
@@ -232,16 +236,20 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
     uint32_t target_l1id = 0xFFFFFFFF;
     bool any_data_left = false;
 
-    // Scan all planes to find the minimum L1ID (target_l1id) among the current entries.
-    // l1idC is the 32-bit non-wrapping trigger counter written by both MaltaDAQ and
-    // Malta2TreeWriter.  Using l1idC instead of l1id avoids the 12-bit (0-4095) rollover
-    // that occurs with real hardware after every 4096 triggers.
+    // Select which branch to use as the event-grouping trigger ID.
+    // For real hardware, l1idC is the 32-bit non-wrapping counter (avoids 12-bit rollover).
+    // For simulation data where l1idC is not written (always 0), set use_l1id=true to
+    // use l1id instead.
+    auto triggerID = [&](size_t i) -> uint32_t {
+        return use_l1id_ ? data_buffer_[i].l1id : data_buffer_[i].l1idC;
+    };
+
     uint32_t max_l1idC_scan = 0;
     for (size_t i = 0; i < n_planes; ++i) {
         if (current_indices_[i] < num_entries_[i]) {
             any_data_left = true;
             chains_[i]->GetEntry(current_indices_[i]);
-            uint32_t current_l1id = data_buffer_[i].l1idC;
+            uint32_t current_l1id = triggerID(i);
 
             if (current_l1id < target_l1id) target_l1id = current_l1id;
             if (current_l1id > max_l1idC_scan) max_l1idC_scan = current_l1id;
@@ -258,7 +266,7 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
         if (hTimerVsEvent_) {
             for (size_t i = 0; i < n_planes; ++i) {
                 if (current_indices_[i] < num_entries_[i] &&
-                    data_buffer_[i].l1idC == target_l1id) {
+                    triggerID(i) == target_l1id) {
                     hTimerVsEvent_->Fill(ev_abs, static_cast<double>(data_buffer_[i].timer));
                     break;
                 }
@@ -304,7 +312,7 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
                 if (current_indices_[i] < num_entries_[i]) {
                     any_data_left = true;
                     chains_[i]->GetEntry(current_indices_[i]);
-                    uint32_t current_l1id = data_buffer_[i].l1idC;
+                    uint32_t current_l1id = triggerID(i);
                     if (current_l1id < target_l1id) {
                         target_l1id = current_l1id;
                     }
@@ -332,17 +340,35 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
         if (current_indices_[i] >= num_entries_[i]) continue;
 
         // Compare the current entry's L1ID with the target L1ID
-        if (data_buffer_[i].l1idC == target_l1id) {
+        if (triggerID(i) == target_l1id) {
             // get all hits for this L1ID in the current plane
             while (current_indices_[i] < num_entries_[i]) {
                 chains_[i]->GetEntry(current_indices_[i]);
-                if (data_buffer_[i].l1idC == target_l1id) {
+                if (triggerID(i) == target_l1id) {
                     decodeAndStore(data_buffer_[i], all_hits_vec[i], det_names_[i]);
                     current_indices_[i]++;
                 } else {
                     break;
                 }
             }
+        }
+    }
+
+    // ROI filter: any hit outside ROI in any plane → discard entire l1id across all planes
+    bool roi_violation = false;
+    for (size_t i = 0; i < n_planes && !roi_violation; ++i) {
+        auto det = get_detector(det_names_[i]);
+        for (const auto& pixel : all_hits_vec[i]) {
+            if (!det->isWithinROI(pixel->column(), pixel->row())) {
+                roi_violation = true;
+                break;
+            }
+        }
+    }
+    if (roi_violation) {
+        LOG(DEBUG) << "L1ID " << target_l1id << ": hit outside ROI, discarding all planes";
+        for (size_t i = 0; i < n_planes; ++i) {
+            all_hits_vec[i].clear();
         }
     }
 
