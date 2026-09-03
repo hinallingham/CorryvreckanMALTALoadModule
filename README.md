@@ -25,6 +25,17 @@ to synchronize hits across multiple detector planes.
 
 1. **Plane 0 (Master)** — sets the target L1ID for each Corryvreckan event.
 2. **Remaining planes (Slaves)** — matched against the same L1ID to form a coincident event.
+3. A candidate L1ID only becomes a real Corryvreckan event if every non-DUT ("reference") plane
+   has a hit at it; DUT planes are exempt. See **Coincidence requirement** below.
+
+**`Pixel` field semantics**
+
+MALTA hits carry no charge-equivalent (`ToT`/`ADC`) value. `charge` is therefore always set to `1`, and the `raw()`
+field — which would normally hold that charge-equivalent value — is repurposed to carry the original `bcid` of the hit
+instead. `winid`/`phase` are not stored separately, but since `timestamp = bcid * 25ns + winid * 3.125ns +
+phase * 0.39ns`, they can be recovered from the residual `timestamp - bcid * 25ns` (see `ClusterDump` for an example).
+Be aware that any downstream module treating `raw()` as an actual charge value (e.g. `Clustering4D` with
+`charge_weighting = true`) will misinterpret this as charge; keep `charge_weighting = false` for MALTA detectors.
 
 ---
 
@@ -41,6 +52,7 @@ to synchronize hits across multiple detector planes.
 | Integrated masking | Corryvreckan `.txt` mask files via `detector->masked(x, y)` |
 | **Near-online mode** | TChain is recreated from scratch on each refresh cycle — avoids ROOT's stale internal `fEntries` problem that prevented `GetEntry()` from reading newly written rows |
 | **Dynamic-axis trends** | All TProfile histograms start with a small range and auto-extend + rebin to ~200 bins regardless of total event count |
+| **Coincidence requirement** | Single-plane noise/dark-count L1IDs (and ROI-violated L1IDs) never become an Event — every non-DUT plane must agree. See **Coincidence requirement** below |
 
 ---
 
@@ -67,12 +79,21 @@ with `SetCanExtend`, and bins are merged back to ~200 each time ROOT doubles the
 
 | Name | Type | Description |
 | :--- | :--- | :--- |
-| `hCoincidenceRateTrend` | TProfile | Coincidence rate [%] vs. event number |
+| `hCoincidenceRateTrend` | TProfile | Coincidence rate [%] vs. event number (DUT participation rate since the coincidence requirement, see below) |
+| `hL1idAcceptanceRateTrend` | TProfile | l1id acceptance rate [%] vs. event number — 100/candidates scanned to find each accepted event; low values mean many single-plane noise/ROI-violated l1ids were discarded first. See **Coincidence Requirement** below |
 | `hHitsPerEventTrend_<det>` | TProfile | Mean hits/event over time per plane |
 | `hHitsPerEventDist_<det>` | TH1F | Distribution of hits/event per plane |
 | `hL1idCVsEvent` | TProfile | l1idC (hardware trigger count) vs. Corryvreckan event — slope > 1 means missed triggers |
 | `hL1idCPlaneDelta` | TH1F | Distribution of max(l1idC)−min(l1idC) across planes per event — 0 = perfect sync |
 | `hTimerVsEvent` | TProfile | Wall-clock elapsed time [s] vs. event number (MaltaDAQ only; 0 for simulation) |
+
+---
+
+## Event Tags
+
+| Tag | Description |
+| :--- | :--- |
+| `wall_clock_time` | Elapsed run time in seconds (same source as `hTimerVsEvent`), attached to every `Event` via `addTag()`. Downstream modules (e.g. `TopupSearch`) can read it with `clipboard->getEvent()->getTag("wall_clock_time")` to build plots against real run time instead of event number or the (locally-scoped) cluster timestamp. |
 
 ---
 
@@ -200,6 +221,64 @@ uint32_t current = data_buffer_[i].l1idC;   // was: data_buffer_[i].l1id
 
 With `number_of_events = 0` (unlimited), the run ends only when corryvreckan is stopped
 manually — via Ctrl-C or the **Exit** button in `OnlineMonitor`.
+
+---
+
+## Coincidence Requirement
+
+### The problem
+
+MaltaMultiDAQ writes hits zero-suppressed: a plane only gets a tree entry for an L1ID it actually
+saw a pixel fire on. Earlier, `run()` treated the minimum L1ID among *any* plane's next unread
+entry as "the event", regardless of whether other planes had anything at that L1ID. In practice
+this meant an isolated noise/dark-count hit on a single plane — one that shares its L1ID with no
+other plane — became its own Corryvreckan Event, with every other plane contributing zero hits.
+Symptoms:
+
+- Corryvreckan's own event count (and `number_of_events`) counted these noise-only L1IDs the same
+  as real multi-plane hits, so it no longer meant "N real events".
+- Per-plane cluster-count trend plots (e.g. `OnlineMonitor`'s Timeline canvas) were dominated by
+  degenerate 0/1 flapping, since most "events" had zero hits on any given plane.
+- The same applied to L1IDs where a hit fell outside ROI: all hits were cleared but the (now
+  empty) L1ID was still emitted as an Event.
+
+### The fix
+
+`run()` now only accepts an L1ID as a real event once every **non-DUT** plane
+(`!hasRole(DUT)`/`AUXILIARY`/`PASSIVE`, computed once in `initialize()` as `coincidence_required_`)
+has a hit at it, and no hit falls outside ROI. Any L1ID that fails either check is discarded —
+not emitted as an empty/partial Event — and the scan silently continues to the next L1ID within
+the same `run()` call. **DUT planes are exempt from this requirement on purpose**: requiring the
+DUT to match too would systematically discard genuine DUT-inefficiency events, which is exactly
+the thing an efficiency measurement needs to see. With this fix, `hCoincidenceRateTrend` /
+`coincidence_ev_count` (previously "did every plane, DUT included, have a hit") is now closer to
+a live DUT-participation-rate proxy, since reference-plane coincidence is guaranteed by
+construction.
+
+This is always on (no config flag) — it is treated as a bug fix, not an opt-in behaviour change.
+If your `detector_names` list contains no non-DUT planes at all, the requirement has nothing to
+check against and every L1ID is accepted, same as before.
+
+### Consequence for `number_of_events`
+
+Because a single `run()` call can now silently consume many discarded L1IDs before returning,
+`number_of_events` (and Corryvreckan's own progress counter) means "N real coincident events",
+not "N L1IDs attempted" — the intended, correct semantics, but worth knowing if you were used to
+the old, inflated count.
+
+### Trade-off
+
+Isolated single-plane hits (e.g. for measuring a bare plane's raw noise rate) are no longer
+visible to Corryvreckan at all once discarded — they never reach `Clustering4D`, `Tracking4D`, or
+any downstream module. If per-plane noise-rate studies independent of coincidence are needed
+later, that would require a separate diagnostic path (not currently implemented).
+
+To at least keep the *aggregate* discard rate visible, `hL1idAcceptanceRateTrend` (and the
+`total_l1id_scanned_`/`total_l1id_accepted_` counters behind the periodic `LOG(INFO)` health
+check) track what fraction of scanned l1id candidates were discarded, without exposing which
+individual hits were thrown away. A falling acceptance rate is an early warning that noise (or
+ROI violations) are eating an increasing share of the data stream, even though the discarded
+candidates themselves stay invisible.
 
 ---
 
