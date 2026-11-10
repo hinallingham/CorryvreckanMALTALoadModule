@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <thread>
 #include "TChainElement.h"
+#include "TSystem.h"
 
 using namespace corryvreckan;
 
@@ -121,13 +122,18 @@ void EventLoaderMALTA::initialize() {
     // Coincidence requirement (see run()): only non-DUT, non-auxiliary, non-passive planes must
     // agree on an l1id for it to count as a real event -- mirrors Module::get_regular_detectors(false).
     coincidence_required_.assign(n_planes, false);
-    for (size_t i = 0; i < n_planes; ++i) {
-        auto detector = get_detector(det_names_[i]);
-        coincidence_required_[i] = !detector->hasRole(DetectorRole::DUT) &&
-                                   !detector->hasRole(DetectorRole::AUXILIARY) &&
-                                   !detector->hasRole(DetectorRole::PASSIVE);
-        if (coincidence_required_[i]) n_coincidence_planes_++;
-    }
+    // ===== TEMPORARY 2026-09-10: pre-2026-09-03 behaviour for a cross-check =====
+    // Leaving every plane at "not required" makes n_coincidence_planes_ stay 0, which the
+    // branch below already treats as the old, accept-every-l1id behaviour. Restore this loop
+    // (or the whole directory) from /home/hinata/package/backup_20260910_EventLoaderMALTA.
+    // for (size_t i = 0; i < n_planes; ++i) {
+    //     auto detector = get_detector(det_names_[i]);
+    //     coincidence_required_[i] = !detector->hasRole(DetectorRole::DUT) &&
+    //                                !detector->hasRole(DetectorRole::AUXILIARY) &&
+    //                                !detector->hasRole(DetectorRole::PASSIVE);
+    //     if (coincidence_required_[i]) n_coincidence_planes_++;
+    // }
+    // ===========================================================================
     if (n_coincidence_planes_ == 0) {
         LOG(WARNING) << "No non-DUT reference planes found among detector_names -- coincidence "
                      << "requirement disabled, every l1id will be accepted as an event (old behaviour).";
@@ -446,7 +452,14 @@ StatusCode EventLoaderMALTA::run(const std::shared_ptr<Clipboard>& clipboard) {
                     clipboard->putEvent(std::make_shared<Event>(0, 0));
                     return StatusCode::EndRun;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                // Wait for MaltaDAQ in short slices, letting ROOT handle GUI events in between.
+                // A DeadTime return skips every module after this one -- OnlineMonitor included --
+                // so without this its window would ignore clicks for as long as no data arrives
+                // (most of the time between two DAQ flushes). No-op when there is no GUI.
+                for (int slice = 0; slice < 5; ++slice) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    gSystem->ProcessEvents();
+                }
                 return StatusCode::DeadTime;
             }
         }
